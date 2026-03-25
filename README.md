@@ -1,18 +1,21 @@
 # ytb
 
-`ytb` is a small Ubuntu-focused command-line tool for downloading YouTube videos and playlists, saving every video into its own folder, and burning manual English subtitles into the final MP4 when those subtitles exist.
+`ytb` is an Ubuntu-focused command-line wrapper around `yt-dlp` and `ffmpeg`.
 
-It supports:
+It downloads YouTube videos and playlists, saves each video into its own folder, downloads only manual English subtitles, and burns those subtitles into a final MP4 when they exist.
 
-- Standard YouTube links like `https://www.youtube.com/watch?v=...`
-- Short links like `https://youtu.be/...`
-- Playlist links like `https://www.youtube.com/playlist?list=...`
-- Watch links that include `list=...`
-- Age-restricted videos, if you have a signed-in browser profile available
+## What it does
 
-It does **not** use YouTube auto-generated subtitles. If a video has no manual English subtitles, `ytb` still downloads the video but skips subtitle burn-in.
+- Supports standard YouTube watch URLs
+- Supports short `youtu.be` URLs
+- Supports playlists
+- Creates one folder per video
+- Keeps the original downloaded media, subtitles, metadata, and logs
+- Burns manual English subtitles into a final MP4
+- Never uses YouTube auto-generated subtitles
+- Retries age-restricted videos with browser cookies only when needed
 
-## What gets created
+## Output layout
 
 Single video:
 
@@ -23,20 +26,42 @@ Single video:
 Playlist:
 
 ```text
-~/Videos/<playlist title> [<playlist id>]/<video title> [<video id>]/
+~/Videos/<playlist title> [<playlist id>]/
+  <video title> [<video id>]/
 ```
 
-Inside each video folder, `ytb` keeps:
+Inside each video folder:
 
-- The downloaded media file
-- The subtitle `.srt` file, if manual English subtitles exist
-- The burned final MP4, named `... [burned].mp4`
+- downloaded media
+- manual English subtitle `.srt`, if available
+- burned MP4 `... [burned].mp4`, if subtitles were burned
 - `metadata.json`
 - `ytb.log`
 
+## Dependency policy
+
+`ytb` installs and updates its dependencies in two different ways on purpose:
+
+- `yt-dlp`: installed from the official upstream GitHub release into `~/.local/bin/yt-dlp`
+- `ffmpeg`: installed from Ubuntu packages with `apt`
+
+Why:
+
+- `yt-dlp` changes fast and the Ubuntu package is often too old for current YouTube behavior
+- `ffmpeg` is stable and safest to get from Ubuntu packages on Ubuntu systems
+
+This means:
+
+- first install gets the latest upstream `yt-dlp`
+- every `ytb` run refreshes `yt-dlp` automatically if the last refresh was more than 7 days ago
+- `ffmpeg` is installed or upgraded by `install.sh`
+- later `ffmpeg` updates should come from normal Ubuntu package updates or by rerunning `./install.sh`
+
+If you specifically want upstream nightly `ffmpeg`, that is a different policy and should use a third-party source or static build. This repository does not do that by default.
+
 ## Before you start
 
-This repository is currently private. Anyone installing it needs GitHub access to the repository first.
+This repository is private right now. Anyone installing it must have GitHub access to the repository.
 
 Ubuntu assumptions:
 
@@ -47,60 +72,42 @@ Ubuntu assumptions:
 
 ## Step-by-step install on Ubuntu
 
-### 1. Install basic packages
+### 1. Install the minimum bootstrap packages
 
 ```bash
 sudo apt-get update
 sudo apt-get install -y git curl
 ```
 
-You do not need to manually install `jq`, `yt-dlp`, or `ffmpeg` ahead of time. `ytb` can install them automatically on first run with `sudo apt-get`.
-
-### 2. Optional but recommended: install Google Chrome for age-restricted videos
-
-If you only download public videos, you can skip this step.
-
-If you want age-restricted videos to work, install Google Chrome and sign in to YouTube in that browser profile:
-
-```bash
-curl -fsSLo /tmp/google-chrome-stable_current_amd64.deb \
-  https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb
-sudo apt-get install -y /tmp/google-chrome-stable_current_amd64.deb
-```
-
-Then start Chrome once and sign in to the YouTube account that can open the age-restricted video:
-
-```bash
-google-chrome
-```
-
-### 3. Clone the repository
-
-If you already have GitHub access configured:
+### 2. Clone the repository
 
 ```bash
 git clone https://github.com/Photowalk/ytb.git
 cd ytb
 ```
 
-If `git clone` asks for authentication, use a GitHub account that has access to this private repository.
+If Git asks for authentication, use a GitHub account that has access to this private repository.
 
-### 4. Install the command
+### 3. Run the installer
 
 ```bash
 chmod +x install.sh
 ./install.sh
 ```
 
-The installer copies `bin/ytb` to `~/.local/bin/ytb`.
+What `install.sh` does:
 
-### 5. Open a new terminal, or reload your shell profile
+- installs or upgrades `curl`, `jq`, and `ffmpeg` with `apt`
+- downloads the latest official `yt-dlp` release into `~/.local/bin/yt-dlp`
+- installs `ytb` into `~/.local/bin/ytb`
+
+### 4. Reload your shell profile
 
 ```bash
 source ~/.profile
 ```
 
-### 6. Run it
+### 5. Run it
 
 Single video:
 
@@ -120,74 +127,71 @@ Playlist:
 ytb "https://www.youtube.com/playlist?list=PLAYLIST_ID"
 ```
 
-## First-run behavior
-
-On the first run, `ytb` checks for:
-
-- `jq`
-- `yt-dlp`
-- `ffmpeg`
-
-If any of them are missing, it runs:
-
-```bash
-sudo apt-get update
-sudo apt-get install -y jq yt-dlp ffmpeg
-```
-
-## How subtitle handling works
-
-- `ytb` only uses manual subtitles from the `subtitles` section of YouTube metadata.
-- `ytb` does not use `automatic_captions`.
-- English subtitle preference order is:
-  - `en`
-  - `en-US`
-  - `en-GB`
-  - any other `en-*`
-- If no manual English subtitles exist, the video is still downloaded, but no burned MP4 is created.
-
 ## Age-restricted videos
 
-By default, `ytb` looks for browser cookies from:
+By default, `ytb` uses browser cookies only if a video actually needs them.
+
+Default cookie browser:
 
 ```bash
 chrome
 ```
 
-If a usable Chrome profile is found, `ytb` passes `--cookies-from-browser chrome` to `yt-dlp`.
+If a video is age-restricted, `ytb` retries with:
 
-If no usable Chrome profile is found:
+```bash
+--cookies-from-browser chrome
+```
 
-- public videos can still work
-- age-restricted videos will usually fail
+Requirements:
 
-You can choose a different browser:
+- the browser profile must exist on this machine
+- that browser must be signed in to YouTube
+- the signed-in account must be able to open the video
+- the desktop keyring must allow cookie decryption
+
+If you want to use Firefox instead:
 
 ```bash
 YTB_COOKIES_BROWSER=firefox ytb "https://www.youtube.com/watch?v=VIDEO_ID"
 ```
 
-You can also disable browser cookies entirely:
+If you want to disable browser cookies entirely:
 
 ```bash
 YTB_COOKIES_BROWSER=none ytb "https://www.youtube.com/watch?v=VIDEO_ID"
 ```
 
-## Optional environment variables
+## Automatic `yt-dlp` updates
 
-Change the output directory:
+`ytb` refreshes `yt-dlp` automatically if the last refresh was more than 7 days ago.
 
-```bash
-YTB_OUTPUT_ROOT="$HOME/MyVideos" ytb "https://www.youtube.com/watch?v=VIDEO_ID"
-```
-
-Use Firefox cookies instead of Chrome:
+You can change that interval:
 
 ```bash
-YTB_COOKIES_BROWSER=firefox ytb "https://www.youtube.com/watch?v=VIDEO_ID"
+YTB_AUTO_UPDATE_DAYS=3 ytb "https://www.youtube.com/watch?v=VIDEO_ID"
 ```
+
+If you want to force a fresh install immediately:
+
+```bash
+./install.sh
+```
+
+## Subtitle rules
+
+- only manual subtitles are used
+- auto-generated subtitles are ignored
+- English preference order:
+  - `en`
+  - `en-US`
+  - `en-GB`
+  - any other `en-*`
+- if no manual English subtitles exist, the video is still downloaded, but no burned MP4 is created
 
 ## Upgrade
+
+To upgrade the repo files and reinstall:
 
 ```bash
 cd ytb
@@ -195,10 +199,17 @@ git pull
 ./install.sh
 ```
 
+This refreshes:
+
+- `ytb`
+- `yt-dlp`
+- Ubuntu-packaged `ffmpeg`
+- Ubuntu-packaged `jq`
+
 ## Uninstall
 
 ```bash
-rm -f ~/.local/bin/ytb
+rm -f ~/.local/bin/ytb ~/.local/bin/yt-dlp
 ```
 
 ## Troubleshooting
@@ -211,27 +222,46 @@ Run:
 source ~/.profile
 ```
 
-If that still fails, confirm `~/.local/bin` is in your `PATH`.
+If that still fails, verify that `~/.local/bin` is in your `PATH`.
 
-### Age-restricted video fails
+### A public video fails with old YouTube extraction errors
 
-Make sure:
+Run:
 
-- Google Chrome is installed, or set `YTB_COOKIES_BROWSER` to a browser you actually use
-- the browser profile is signed in to YouTube
-- the signed-in account can open that exact video in the browser
+```bash
+./install.sh
+```
+
+This installs the current upstream `yt-dlp`, which is the main fix when YouTube changes.
+
+### Age-restricted video fails with cookie errors
+
+Typical causes:
+
+- browser profile exists but is not signed in
+- desktop keyring is locked
+- Chrome cookies could not be decrypted
+- the selected browser is not the one you actually use for YouTube
+
+Try one of these:
+
+```bash
+YTB_COOKIES_BROWSER=firefox ytb "https://www.youtube.com/watch?v=VIDEO_ID"
+```
+
+```bash
+YTB_COOKIES_BROWSER=none ytb "https://www.youtube.com/watch?v=VIDEO_ID"
+```
+
+For public videos, disabling cookies is often fine.
 
 ### Playlist partially fails
 
-`ytb` continues through the rest of the playlist when a single item fails. Common reasons:
+`ytb` continues through the playlist, but returns a non-zero exit code at the end if one or more items had a hard failure.
 
-- private video
-- deleted video
+Common reasons:
+
+- private or deleted video
 - region restriction
-- unavailable age-restricted cookies
-
-At the end, the command returns a non-zero exit code if any playlist item had a hard failure.
-
-### No subtitle burn-in happened
-
-That usually means the video does not have manual English subtitles. In that case, the downloaded media is still kept in the video folder, and the warning is written to `ytb.log`.
+- age restriction without usable browser cookies
+- temporary YouTube/network failure

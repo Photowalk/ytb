@@ -6,10 +6,14 @@ shopt -s nullglob
 SCRIPT_NAME="ytb"
 OUTPUT_ROOT="${YTB_OUTPUT_ROOT:-${HOME}/Videos}"
 COOKIE_BROWSER="${YTB_COOKIES_BROWSER:-chrome}"
+AUTO_UPDATE_DAYS="${YTB_AUTO_UPDATE_DAYS:-7}"
+STATE_DIR="${XDG_STATE_HOME:-${HOME}/.local/state}/ytb"
+LOCAL_BIN_DIR="${HOME}/.local/bin"
 
 CURRENT_LOG_FILE=""
 LAST_VIDEO_STATUS="failed"
-YTDLP_COOKIE_ARGS=()
+COOKIE_BROWSER_AVAILABLE=0
+YTDLP_BIN=""
 
 usage() {
   cat <<'EOF'
@@ -19,11 +23,13 @@ Downloads a YouTube video or playlist into ~/Videos by default.
 - Each video gets its own directory.
 - Manual English subtitles are burned into a final MP4 when available.
 - Auto-generated subtitles are never used.
-- Age-restricted videos need a signed-in browser profile. Default browser: chrome.
+- yt-dlp is auto-installed from the official upstream release and refreshed periodically.
+- Age-restricted videos retry with browser cookies only when needed.
 
 Optional environment variables:
 - YTB_OUTPUT_ROOT=/path/to/output
 - YTB_COOKIES_BROWSER=chrome|firefox|chromium|none
+- YTB_AUTO_UPDATE_DAYS=7
 EOF
 }
 
@@ -92,11 +98,11 @@ is_supported_youtube_url() {
   esac
 }
 
-ensure_runtime_dependencies() {
+ensure_base_dependencies() {
   local missing=()
   local dep
 
-  for dep in jq yt-dlp ffmpeg; do
+  for dep in curl jq ffmpeg; do
     if ! command -v "$dep" >/dev/null 2>&1; then
       missing+=("$dep")
     fi
@@ -106,7 +112,7 @@ ensure_runtime_dependencies() {
     return 0
   fi
 
-  log "Installing missing dependencies: ${missing[*]}"
+  log "Installing missing Ubuntu packages: ${missing[*]}"
 
   if ! command -v sudo >/dev/null 2>&1; then
     die "sudo is required to install missing dependencies automatically"
@@ -117,12 +123,106 @@ ensure_runtime_dependencies() {
   fi
 
   if ! sudo apt-get install -y "${missing[@]}"; then
-    die "Failed to install required dependencies with apt"
+    die "Failed to install required Ubuntu packages"
   fi
 
-  for dep in jq yt-dlp ffmpeg; do
+  for dep in curl jq ffmpeg; do
     command -v "$dep" >/dev/null 2>&1 || die "$dep is still unavailable after installation"
   done
+}
+
+detect_ytdlp_asset() {
+  case "$(uname -m)" in
+    x86_64|amd64)
+      printf 'yt-dlp_linux'
+      ;;
+    aarch64|arm64)
+      printf 'yt-dlp_linux_aarch64'
+      ;;
+    *)
+      printf 'yt-dlp'
+      ;;
+  esac
+}
+
+refresh_is_due() {
+  local stamp_file="$1"
+  local max_age_days="$2"
+  local now last_check
+
+  [[ -f "$stamp_file" ]] || return 0
+  now="$(date +%s)"
+  last_check="$(cat "$stamp_file" 2>/dev/null || printf '0')"
+
+  [[ "$last_check" =~ ^[0-9]+$ ]] || return 0
+  (( now - last_check >= max_age_days * 86400 ))
+}
+
+mark_refreshed() {
+  local stamp_file="$1"
+  mkdir -p "$(dirname "$stamp_file")"
+  date +%s >"$stamp_file"
+}
+
+install_latest_ytdlp() {
+  local target_path="${LOCAL_BIN_DIR}/yt-dlp"
+  local temp_file asset_name url version
+
+  mkdir -p "$LOCAL_BIN_DIR"
+  asset_name="$(detect_ytdlp_asset)"
+  url="https://github.com/yt-dlp/yt-dlp/releases/latest/download/${asset_name}"
+  temp_file="$(mktemp)"
+
+  log "Installing latest yt-dlp from official release"
+  if ! curl -fsSL "$url" -o "$temp_file"; then
+    rm -f "$temp_file"
+    return 1
+  fi
+
+  if ! install -m 0755 "$temp_file" "$target_path"; then
+    rm -f "$temp_file"
+    return 1
+  fi
+  rm -f "$temp_file"
+
+  YTDLP_BIN="$target_path"
+  version="$("$YTDLP_BIN" --version 2>/dev/null | head -n 1 || true)"
+  [[ -n "$version" ]] || return 1
+  log "Using yt-dlp ${version} from ${YTDLP_BIN}"
+  return 0
+}
+
+ensure_ytdlp() {
+  local refresh_stamp="${STATE_DIR}/yt-dlp-last-refresh"
+  local system_ytdlp
+  local refresh_due=0
+
+  if [[ -x "${LOCAL_BIN_DIR}/yt-dlp" ]]; then
+    YTDLP_BIN="${LOCAL_BIN_DIR}/yt-dlp"
+  else
+    system_ytdlp="$(command -v yt-dlp 2>/dev/null || true)"
+    if [[ -n "$system_ytdlp" ]]; then
+      YTDLP_BIN="$system_ytdlp"
+    fi
+  fi
+
+  if refresh_is_due "$refresh_stamp" "$AUTO_UPDATE_DAYS"; then
+    refresh_due=1
+  fi
+
+  if [[ -z "$YTDLP_BIN" || ! -x "$YTDLP_BIN" ]] || ((refresh_due)); then
+    if ! install_latest_ytdlp; then
+      if [[ -n "$YTDLP_BIN" && -x "$YTDLP_BIN" ]]; then
+        warn "Could not refresh yt-dlp from GitHub; falling back to ${YTDLP_BIN}"
+      else
+        die "Could not install yt-dlp from GitHub"
+      fi
+    else
+      mark_refreshed "$refresh_stamp"
+    fi
+  fi
+
+  [[ -n "$YTDLP_BIN" && -x "$YTDLP_BIN" ]] || die "yt-dlp is unavailable after installation"
 }
 
 browser_profile_exists() {
@@ -149,25 +249,55 @@ browser_profile_exists() {
   esac
 }
 
-init_cookie_args() {
+init_cookie_support() {
   if [[ "$COOKIE_BROWSER" == "none" ]]; then
+    COOKIE_BROWSER_AVAILABLE=0
     log "Browser cookies disabled via YTB_COOKIES_BROWSER=none"
-    YTDLP_COOKIE_ARGS=()
     return 0
   fi
 
   if browser_profile_exists "$COOKIE_BROWSER"; then
-    YTDLP_COOKIE_ARGS=(--cookies-from-browser "$COOKIE_BROWSER")
-    log "Using browser cookies from ${COOKIE_BROWSER}"
+    COOKIE_BROWSER_AVAILABLE=1
+    log "Will retry age-restricted videos with browser cookies from ${COOKIE_BROWSER}"
     return 0
   fi
 
-  warn "No usable ${COOKIE_BROWSER} browser profile was found. Continuing without browser cookies; age-restricted videos may fail."
-  YTDLP_COOKIE_ARGS=()
+  COOKIE_BROWSER_AVAILABLE=0
+  warn "No usable ${COOKIE_BROWSER} browser profile was found. Public videos can still work, but age-restricted videos may fail."
 }
 
-yt_dlp_cmd() {
-  yt-dlp "${YTDLP_COOKIE_ARGS[@]}" "$@"
+is_age_gate_error() {
+  local error_file="$1"
+  grep -Eiq 'Sign in to confirm your age|Please sign in|This video may be inappropriate for some users|age-restricted' "$error_file"
+}
+
+is_cookie_decryption_error() {
+  local error_file="$1"
+  grep -Eiq 'cannot decrypt|could not decrypt|could not be decrypted|Extracted 0 cookies|no key found' "$error_file"
+}
+
+yt_dlp_capture_json() {
+  local output_json="$1"
+  local error_file="$2"
+  local cookie_mode_var="$3"
+  shift 3
+  local -a args=("$@")
+
+  if "$YTDLP_BIN" "${args[@]}" >"$output_json" 2>"$error_file"; then
+    printf -v "$cookie_mode_var" '%s' "0"
+    return 0
+  fi
+
+  if ((COOKIE_BROWSER_AVAILABLE)) && is_age_gate_error "$error_file"; then
+    log "Retrying with ${COOKIE_BROWSER} cookies"
+    if "$YTDLP_BIN" --cookies-from-browser "$COOKIE_BROWSER" "${args[@]}" >"$output_json" 2>"$error_file"; then
+      printf -v "$cookie_mode_var" '%s' "1"
+      return 0
+    fi
+  fi
+
+  printf -v "$cookie_mode_var" '%s' "0"
+  return 1
 }
 
 choose_manual_english_subtitle() {
@@ -212,30 +342,39 @@ fetch_top_level_json() {
   local url="$1"
   local output_json="$2"
   local error_file="$3"
+  local cookie_mode_var="$4"
 
-  yt_dlp_cmd \
+  yt_dlp_capture_json "$output_json" "$error_file" "$cookie_mode_var" \
     --dump-single-json \
     --flat-playlist \
-    "$url" >"$output_json" 2>"$error_file"
+    "$url"
 }
 
 fetch_video_metadata() {
   local url="$1"
   local output_json="$2"
   local error_file="$3"
+  local cookie_mode_var="$4"
 
-  yt_dlp_cmd \
+  yt_dlp_capture_json "$output_json" "$error_file" "$cookie_mode_var" \
     --dump-single-json \
-    "$url" >"$output_json" 2>"$error_file"
+    "$url"
 }
 
 download_media() {
   local url="$1"
   local outtmpl="$2"
   local path_file="$3"
+  local use_cookies="$4"
+  local -a cookie_args=()
+
+  if [[ "$use_cookies" == "1" ]]; then
+    cookie_args=(--cookies-from-browser "$COOKIE_BROWSER")
+  fi
 
   : >"$path_file"
-  run_logged yt_dlp_cmd \
+  run_logged "$YTDLP_BIN" \
+    "${cookie_args[@]}" \
     --print-to-file after_move:filepath "$path_file" \
     --format "bv*+ba/b" \
     --output "$outtmpl" \
@@ -246,8 +385,15 @@ download_manual_subtitles() {
   local url="$1"
   local outtmpl="$2"
   local subtitle_lang="$3"
+  local use_cookies="$4"
+  local -a cookie_args=()
 
-  run_logged yt_dlp_cmd \
+  if [[ "$use_cookies" == "1" ]]; then
+    cookie_args=(--cookies-from-browser "$COOKIE_BROWSER")
+  fi
+
+  run_logged "$YTDLP_BIN" \
+    "${cookie_args[@]}" \
     --skip-download \
     --write-subs \
     --sub-langs "$subtitle_lang" \
@@ -260,31 +406,43 @@ burn_subtitles() {
   local media_path="$1"
   local subtitle_path="$2"
   local output_path="$3"
-  local subtitle_filter
+  local workdir media_name output_name temp_subtitle temp_subtitle_name
+  local status
 
-  subtitle_filter="$(printf '%s' "$subtitle_path" | sed "s/'/'\\\\''/g")"
+  workdir="$(dirname "$subtitle_path")"
+  media_name="$(basename "$media_path")"
+  output_name="$(basename "$output_path")"
+  temp_subtitle_name=".ytb-burn-input.srt"
+  temp_subtitle="${workdir}/${temp_subtitle_name}"
 
-  run_logged ffmpeg \
-    -y \
-    -i "$media_path" \
-    -vf "subtitles='${subtitle_filter}'" \
-    -map 0:v:0 \
-    -map 0:a? \
-    -c:v libx264 \
-    -preset medium \
-    -crf 18 \
-    -pix_fmt yuv420p \
-    -c:a aac \
-    -b:a 192k \
-    -movflags +faststart \
-    -sn \
-    "$output_path"
+  cp "$subtitle_path" "$temp_subtitle" || return 1
+
+  (
+    cd "$workdir" || exit 1
+    run_logged ffmpeg \
+      -y \
+      -i "$media_name" \
+      -vf "subtitles=${temp_subtitle_name}" \
+      -map "0:v:0" \
+      -map "0:a?" \
+      -c:v libx264 \
+      -preset medium \
+      -crf 18 \
+      -pix_fmt yuv420p \
+      -c:a aac \
+      -b:a 192k \
+      -movflags +faststart \
+      -sn \
+      "$output_name"
+  )
+  status=$?
+  rm -f "$temp_subtitle"
+  return "$status"
 }
 
 record_metadata_copy() {
   local source_json="$1"
   local target_path="$2"
-
   cp "$source_json" "$target_path"
 }
 
@@ -294,7 +452,7 @@ process_video() {
   local fallback_title="${3:-Unknown Video}"
   local fallback_id="${4:-}"
 
-  local metadata_json error_file
+  local metadata_json error_file used_cookies
   local raw_title safe_title video_id dir_name video_dir
   local base_name base_path subtitle_lang subtitle_path burned_path
   local path_file media_path
@@ -302,8 +460,9 @@ process_video() {
   LAST_VIDEO_STATUS="failed"
   metadata_json="$(mktemp)"
   error_file="$(mktemp)"
+  used_cookies="0"
 
-  if ! fetch_video_metadata "$video_url" "$metadata_json" "$error_file"; then
+  if ! fetch_video_metadata "$video_url" "$metadata_json" "$error_file" used_cookies; then
     safe_title="$(sanitize_name "$fallback_title")"
     if [[ -n "$fallback_id" ]]; then
       dir_name="${safe_title} [${fallback_id}]"
@@ -316,8 +475,14 @@ process_video() {
     : >"$CURRENT_LOG_FILE"
     write_error_log "$error_file"
 
-    if grep -qi 'Sign in to confirm your age' "$error_file"; then
-      warn "Failed to access ${video_url}. A signed-in ${COOKIE_BROWSER} profile is required for this age-restricted video."
+    if is_age_gate_error "$error_file"; then
+      if is_cookie_decryption_error "$error_file"; then
+        warn "Failed to access ${video_url}. ${COOKIE_BROWSER} cookies could not be decrypted. Unlock your desktop keyring, re-open the browser, or try YTB_COOKIES_BROWSER=firefox."
+      elif ((COOKIE_BROWSER_AVAILABLE)); then
+        warn "Failed to access ${video_url}. A signed-in ${COOKIE_BROWSER} profile is required for this age-restricted video."
+      else
+        warn "Failed to access ${video_url}. Configure YTB_COOKIES_BROWSER for a signed-in browser profile to handle age-restricted videos."
+      fi
     else
       warn "Failed to fetch metadata for ${video_url}"
     fi
@@ -354,7 +519,7 @@ process_video() {
   base_path="${video_dir}/${base_name}"
   path_file="$(mktemp)"
 
-  if ! download_media "$video_url" "${base_path}.%(ext)s" "$path_file"; then
+  if ! download_media "$video_url" "${base_path}.%(ext)s" "$path_file" "$used_cookies"; then
     warn "Media download failed for ${raw_title}"
     rm -f "$metadata_json" "$error_file" "$path_file"
     return 1
@@ -375,7 +540,7 @@ process_video() {
     return 0
   fi
 
-  if ! download_manual_subtitles "$video_url" "${base_path}.%(ext)s" "$subtitle_lang"; then
+  if ! download_manual_subtitles "$video_url" "${base_path}.%(ext)s" "$subtitle_lang" "$used_cookies"; then
     warn "Subtitle download failed for ${raw_title}"
     rm -f "$metadata_json" "$error_file" "$path_file"
     return 1
@@ -490,7 +655,7 @@ process_playlist() {
 }
 
 main() {
-  local input_url top_level_json top_level_error
+  local input_url top_level_json top_level_error top_level_used_cookies
 
   if [[ $# -ne 1 ]]; then
     usage >&2
@@ -502,16 +667,23 @@ main() {
     die "Unsupported URL. Pass a YouTube watch, short, shorts, or playlist URL."
   fi
 
-  ensure_runtime_dependencies
-  init_cookie_args
+  ensure_base_dependencies
+  ensure_ytdlp
+  init_cookie_support
   mkdir -p "$OUTPUT_ROOT"
 
   top_level_json="$(mktemp)"
   top_level_error="$(mktemp)"
+  top_level_used_cookies="0"
 
-  if ! fetch_top_level_json "$input_url" "$top_level_json" "$top_level_error"; then
-    if grep -qi 'Sign in to confirm your age' "$top_level_error"; then
-      die "Failed to access the URL. A signed-in ${COOKIE_BROWSER} profile is required for this age-restricted video."
+  if ! fetch_top_level_json "$input_url" "$top_level_json" "$top_level_error" top_level_used_cookies; then
+    if is_age_gate_error "$top_level_error"; then
+      if is_cookie_decryption_error "$top_level_error"; then
+        die "${COOKIE_BROWSER} cookies could not be decrypted. Unlock your desktop keyring, re-open the browser, or try YTB_COOKIES_BROWSER=firefox."
+      elif ((COOKIE_BROWSER_AVAILABLE)); then
+        die "A signed-in ${COOKIE_BROWSER} profile is required for this age-restricted video."
+      fi
+      die "This URL requires a signed-in browser profile. Set YTB_COOKIES_BROWSER to a browser that is signed in."
     fi
     die "Failed to inspect the YouTube URL"
   fi
