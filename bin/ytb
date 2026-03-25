@@ -1,0 +1,537 @@
+#!/usr/bin/env bash
+
+set -uo pipefail
+shopt -s nullglob
+
+SCRIPT_NAME="ytb"
+OUTPUT_ROOT="${YTB_OUTPUT_ROOT:-${HOME}/Videos}"
+COOKIE_BROWSER="${YTB_COOKIES_BROWSER:-chrome}"
+
+CURRENT_LOG_FILE=""
+LAST_VIDEO_STATUS="failed"
+YTDLP_COOKIE_ARGS=()
+
+usage() {
+  cat <<'EOF'
+Usage: ytb <youtube-url>
+
+Downloads a YouTube video or playlist into ~/Videos by default.
+- Each video gets its own directory.
+- Manual English subtitles are burned into a final MP4 when available.
+- Auto-generated subtitles are never used.
+- Age-restricted videos need a signed-in browser profile. Default browser: chrome.
+
+Optional environment variables:
+- YTB_OUTPUT_ROOT=/path/to/output
+- YTB_COOKIES_BROWSER=chrome|firefox|chromium|none
+EOF
+}
+
+log() {
+  local message="$1"
+  printf '[%s] %s\n' "$SCRIPT_NAME" "$message" >&2
+  if [[ -n "${CURRENT_LOG_FILE:-}" ]]; then
+    printf '[%s] %s\n' "$SCRIPT_NAME" "$message" >>"$CURRENT_LOG_FILE"
+  fi
+}
+
+warn() {
+  log "WARNING: $1"
+}
+
+die() {
+  log "ERROR: $1"
+  exit 1
+}
+
+run_logged() {
+  local log_file="${CURRENT_LOG_FILE:-}"
+  if [[ -n "$log_file" ]]; then
+    "$@" 2>&1 | tee -a "$log_file"
+    return "${PIPESTATUS[0]}"
+  fi
+  "$@"
+}
+
+sanitize_name() {
+  local input="$1"
+  local sanitized
+
+  sanitized="$(printf '%s' "$input" \
+    | tr '\r\n\t' '   ' \
+    | sed -E "s/[^[:alnum:] ._()-]+/-/g; s/[[:space:]]+/ /g; s/^[[:space:].-]+//; s/[[:space:].-]+$//; s/-{2,}/-/g" \
+    | cut -c1-180)"
+
+  if [[ -z "$sanitized" ]]; then
+    sanitized="untitled"
+  fi
+
+  printf '%s' "$sanitized"
+}
+
+get_url_host() {
+  local url="$1"
+  local without_scheme="${url#*://}"
+  printf '%s' "${without_scheme%%/*}"
+}
+
+is_supported_youtube_url() {
+  local url="$1"
+  local host
+
+  [[ "$url" == http://* || "$url" == https://* ]] || return 1
+  host="$(get_url_host "$url")"
+
+  case "$host" in
+    youtube.com|www.youtube.com|m.youtube.com|youtu.be)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+ensure_runtime_dependencies() {
+  local missing=()
+  local dep
+
+  for dep in jq yt-dlp ffmpeg; do
+    if ! command -v "$dep" >/dev/null 2>&1; then
+      missing+=("$dep")
+    fi
+  done
+
+  if ((${#missing[@]} == 0)); then
+    return 0
+  fi
+
+  log "Installing missing dependencies: ${missing[*]}"
+
+  if ! command -v sudo >/dev/null 2>&1; then
+    die "sudo is required to install missing dependencies automatically"
+  fi
+
+  if ! sudo apt-get update; then
+    die "Failed to run: sudo apt-get update"
+  fi
+
+  if ! sudo apt-get install -y "${missing[@]}"; then
+    die "Failed to install required dependencies with apt"
+  fi
+
+  for dep in jq yt-dlp ffmpeg; do
+    command -v "$dep" >/dev/null 2>&1 || die "$dep is still unavailable after installation"
+  done
+}
+
+browser_profile_exists() {
+  local browser="$1"
+
+  case "$browser" in
+    none)
+      return 1
+      ;;
+    chrome)
+      [[ -d "${HOME}/.config/google-chrome" \
+        || -d "${HOME}/.config/google-chrome-beta" \
+        || -d "${HOME}/.config/google-chrome-unstable" ]]
+      ;;
+    firefox)
+      [[ -d "${HOME}/.mozilla/firefox" ]]
+      ;;
+    chromium)
+      [[ -d "${HOME}/.config/chromium" ]]
+      ;;
+    *)
+      return 0
+      ;;
+  esac
+}
+
+init_cookie_args() {
+  if [[ "$COOKIE_BROWSER" == "none" ]]; then
+    log "Browser cookies disabled via YTB_COOKIES_BROWSER=none"
+    YTDLP_COOKIE_ARGS=()
+    return 0
+  fi
+
+  if browser_profile_exists "$COOKIE_BROWSER"; then
+    YTDLP_COOKIE_ARGS=(--cookies-from-browser "$COOKIE_BROWSER")
+    log "Using browser cookies from ${COOKIE_BROWSER}"
+    return 0
+  fi
+
+  warn "No usable ${COOKIE_BROWSER} browser profile was found. Continuing without browser cookies; age-restricted videos may fail."
+  YTDLP_COOKIE_ARGS=()
+}
+
+yt_dlp_cmd() {
+  yt-dlp "${YTDLP_COOKIE_ARGS[@]}" "$@"
+}
+
+choose_manual_english_subtitle() {
+  local metadata_json="$1"
+
+  jq -r '
+    (.subtitles // {}) as $subs
+    | if ($subs | has("en")) then
+        "en"
+      elif ($subs | has("en-US")) then
+        "en-US"
+      elif ($subs | has("en-GB")) then
+        "en-GB"
+      else
+        ($subs | keys_unsorted[]? | select(test("^en-")))
+      end
+  ' "$metadata_json" | head -n 1
+}
+
+is_playlist_json() {
+  local metadata_json="$1"
+
+  jq -e '
+    (._type // "") == "playlist"
+    or ((.entries // null) != null and (.entries | type) == "array")
+  ' "$metadata_json" >/dev/null 2>&1
+}
+
+build_watch_url() {
+  local value="$1"
+  printf 'https://www.youtube.com/watch?v=%s' "$value"
+}
+
+write_error_log() {
+  local error_file="$1"
+  if [[ -n "${CURRENT_LOG_FILE:-}" && -f "$error_file" ]]; then
+    cat "$error_file" >>"$CURRENT_LOG_FILE"
+  fi
+}
+
+fetch_top_level_json() {
+  local url="$1"
+  local output_json="$2"
+  local error_file="$3"
+
+  yt_dlp_cmd \
+    --dump-single-json \
+    --flat-playlist \
+    "$url" >"$output_json" 2>"$error_file"
+}
+
+fetch_video_metadata() {
+  local url="$1"
+  local output_json="$2"
+  local error_file="$3"
+
+  yt_dlp_cmd \
+    --dump-single-json \
+    "$url" >"$output_json" 2>"$error_file"
+}
+
+download_media() {
+  local url="$1"
+  local outtmpl="$2"
+  local path_file="$3"
+
+  : >"$path_file"
+  run_logged yt_dlp_cmd \
+    --print-to-file after_move:filepath "$path_file" \
+    --format "bv*+ba/b" \
+    --output "$outtmpl" \
+    "$url"
+}
+
+download_manual_subtitles() {
+  local url="$1"
+  local outtmpl="$2"
+  local subtitle_lang="$3"
+
+  run_logged yt_dlp_cmd \
+    --skip-download \
+    --write-subs \
+    --sub-langs "$subtitle_lang" \
+    --convert-subs srt \
+    --output "$outtmpl" \
+    "$url"
+}
+
+burn_subtitles() {
+  local media_path="$1"
+  local subtitle_path="$2"
+  local output_path="$3"
+  local subtitle_filter
+
+  subtitle_filter="$(printf '%s' "$subtitle_path" | sed "s/'/'\\\\''/g")"
+
+  run_logged ffmpeg \
+    -y \
+    -i "$media_path" \
+    -vf "subtitles='${subtitle_filter}'" \
+    -map 0:v:0 \
+    -map 0:a? \
+    -c:v libx264 \
+    -preset medium \
+    -crf 18 \
+    -pix_fmt yuv420p \
+    -c:a aac \
+    -b:a 192k \
+    -movflags +faststart \
+    -sn \
+    "$output_path"
+}
+
+record_metadata_copy() {
+  local source_json="$1"
+  local target_path="$2"
+
+  cp "$source_json" "$target_path"
+}
+
+process_video() {
+  local video_url="$1"
+  local parent_dir="$2"
+  local fallback_title="${3:-Unknown Video}"
+  local fallback_id="${4:-}"
+
+  local metadata_json error_file
+  local raw_title safe_title video_id dir_name video_dir
+  local base_name base_path subtitle_lang subtitle_path burned_path
+  local path_file media_path
+
+  LAST_VIDEO_STATUS="failed"
+  metadata_json="$(mktemp)"
+  error_file="$(mktemp)"
+
+  if ! fetch_video_metadata "$video_url" "$metadata_json" "$error_file"; then
+    safe_title="$(sanitize_name "$fallback_title")"
+    if [[ -n "$fallback_id" ]]; then
+      dir_name="${safe_title} [${fallback_id}]"
+    else
+      dir_name="$safe_title"
+    fi
+    video_dir="${parent_dir}/${dir_name}"
+    mkdir -p "$video_dir"
+    CURRENT_LOG_FILE="${video_dir}/ytb.log"
+    : >"$CURRENT_LOG_FILE"
+    write_error_log "$error_file"
+
+    if grep -qi 'Sign in to confirm your age' "$error_file"; then
+      warn "Failed to access ${video_url}. A signed-in ${COOKIE_BROWSER} profile is required for this age-restricted video."
+    else
+      warn "Failed to fetch metadata for ${video_url}"
+    fi
+
+    rm -f "$metadata_json" "$error_file"
+    return 1
+  fi
+
+  raw_title="$(jq -r '.title // empty' "$metadata_json")"
+  video_id="$(jq -r '.id // empty' "$metadata_json")"
+  if [[ -z "$raw_title" ]]; then
+    raw_title="$fallback_title"
+  fi
+  if [[ -z "$video_id" ]]; then
+    video_id="$fallback_id"
+  fi
+
+  safe_title="$(sanitize_name "$raw_title")"
+  if [[ -n "$video_id" ]]; then
+    dir_name="${safe_title} [${video_id}]"
+  else
+    dir_name="$safe_title"
+  fi
+
+  video_dir="${parent_dir}/${dir_name}"
+  mkdir -p "$video_dir"
+  CURRENT_LOG_FILE="${video_dir}/ytb.log"
+  : >"$CURRENT_LOG_FILE"
+
+  record_metadata_copy "$metadata_json" "${video_dir}/metadata.json"
+  log "Processing video: ${raw_title}"
+
+  base_name="$dir_name"
+  base_path="${video_dir}/${base_name}"
+  path_file="$(mktemp)"
+
+  if ! download_media "$video_url" "${base_path}.%(ext)s" "$path_file"; then
+    warn "Media download failed for ${raw_title}"
+    rm -f "$metadata_json" "$error_file" "$path_file"
+    return 1
+  fi
+
+  media_path="$(tail -n 1 "$path_file")"
+  if [[ -z "$media_path" || ! -f "$media_path" ]]; then
+    warn "Could not determine downloaded media path for ${raw_title}"
+    rm -f "$metadata_json" "$error_file" "$path_file"
+    return 1
+  fi
+
+  subtitle_lang="$(choose_manual_english_subtitle "$metadata_json")"
+  if [[ -z "$subtitle_lang" ]]; then
+    warn "No manual English subtitles found for ${raw_title}; kept media without burned subtitles"
+    LAST_VIDEO_STATUS="downloaded_no_subtitles"
+    rm -f "$metadata_json" "$error_file" "$path_file"
+    return 0
+  fi
+
+  if ! download_manual_subtitles "$video_url" "${base_path}.%(ext)s" "$subtitle_lang"; then
+    warn "Subtitle download failed for ${raw_title}"
+    rm -f "$metadata_json" "$error_file" "$path_file"
+    return 1
+  fi
+
+  subtitle_path="${base_path}.${subtitle_lang}.srt"
+  if [[ ! -f "$subtitle_path" ]]; then
+    local matches=( "${base_path}".en*.srt )
+    if ((${#matches[@]} > 0)); then
+      subtitle_path="${matches[0]}"
+    fi
+  fi
+
+  if [[ ! -f "$subtitle_path" ]]; then
+    warn "Subtitle file was not created for ${raw_title}"
+    rm -f "$metadata_json" "$error_file" "$path_file"
+    return 1
+  fi
+
+  burned_path="${base_path} [burned].mp4"
+  if ! burn_subtitles "$media_path" "$subtitle_path" "$burned_path"; then
+    warn "Subtitle burn-in failed for ${raw_title}"
+    rm -f "$metadata_json" "$error_file" "$path_file"
+    return 1
+  fi
+
+  log "Created burned video: ${burned_path}"
+  LAST_VIDEO_STATUS="burned"
+  rm -f "$metadata_json" "$error_file" "$path_file"
+  return 0
+}
+
+process_playlist() {
+  local top_level_json="$1"
+
+  local playlist_title playlist_id safe_playlist_title playlist_dir
+  local -a entry_payloads failed_items
+  local processed=0 burned=0 without_subtitles=0 hard_failures=0
+  local entry_payload entry_json fallback_id fallback_title entry_url
+
+  playlist_title="$(jq -r '.title // .playlist_title // "Playlist"' "$top_level_json")"
+  playlist_id="$(jq -r '.id // .playlist_id // empty' "$top_level_json")"
+  safe_playlist_title="$(sanitize_name "$playlist_title")"
+
+  if [[ -n "$playlist_id" ]]; then
+    playlist_dir="${OUTPUT_ROOT}/${safe_playlist_title} [${playlist_id}]"
+  else
+    playlist_dir="${OUTPUT_ROOT}/${safe_playlist_title}"
+  fi
+
+  mkdir -p "$playlist_dir"
+  record_metadata_copy "$top_level_json" "${playlist_dir}/metadata.json"
+  CURRENT_LOG_FILE="${playlist_dir}/ytb.log"
+  : >"$CURRENT_LOG_FILE"
+  log "Processing playlist: ${playlist_title}"
+
+  mapfile -t entry_payloads < <(jq -r '(.entries // [])[] | @base64' "$top_level_json")
+  if ((${#entry_payloads[@]} == 0)); then
+    die "Playlist metadata was fetched, but no entries were found"
+  fi
+
+  for entry_payload in "${entry_payloads[@]}"; do
+    processed=$((processed + 1))
+    entry_json="$(printf '%s' "$entry_payload" | base64 --decode)"
+    fallback_id="$(jq -r '.id // empty' <<<"$entry_json")"
+    fallback_title="$(jq -r '.title // "Unknown Video"' <<<"$entry_json")"
+    entry_url="$(jq -r '.webpage_url // .url // empty' <<<"$entry_json")"
+
+    if [[ -z "$entry_url" && -n "$fallback_id" ]]; then
+      entry_url="$(build_watch_url "$fallback_id")"
+    elif [[ -n "$entry_url" && "$entry_url" != http://* && "$entry_url" != https://* ]]; then
+      entry_url="$(build_watch_url "$entry_url")"
+    fi
+
+    if [[ -z "$entry_url" ]]; then
+      hard_failures=$((hard_failures + 1))
+      failed_items+=("${fallback_title}${fallback_id:+ [${fallback_id}]}")
+      warn "Skipping a playlist entry because no usable video URL was present"
+      continue
+    fi
+
+    if process_video "$entry_url" "$playlist_dir" "$fallback_title" "$fallback_id"; then
+      case "$LAST_VIDEO_STATUS" in
+        burned)
+          burned=$((burned + 1))
+          ;;
+        downloaded_no_subtitles)
+          without_subtitles=$((without_subtitles + 1))
+          ;;
+      esac
+    else
+      hard_failures=$((hard_failures + 1))
+      failed_items+=("${fallback_title}${fallback_id:+ [${fallback_id}]}")
+    fi
+  done
+
+  CURRENT_LOG_FILE="${playlist_dir}/ytb.log"
+  log "Playlist summary: total=${processed}, burned=${burned}, no-manual-en-subs=${without_subtitles}, hard-failures=${hard_failures}"
+
+  if ((${#failed_items[@]} > 0)); then
+    printf '[%s] Failed items:\n' "$SCRIPT_NAME" >&2
+    for entry_payload in "${failed_items[@]}"; do
+      printf '[%s] - %s\n' "$SCRIPT_NAME" "$entry_payload" >&2
+      printf '[%s] - %s\n' "$SCRIPT_NAME" "$entry_payload" >>"$CURRENT_LOG_FILE"
+    done
+  fi
+
+  if ((hard_failures > 0)); then
+    return 1
+  fi
+  return 0
+}
+
+main() {
+  local input_url top_level_json top_level_error
+
+  if [[ $# -ne 1 ]]; then
+    usage >&2
+    exit 1
+  fi
+
+  input_url="$1"
+  if ! is_supported_youtube_url "$input_url"; then
+    die "Unsupported URL. Pass a YouTube watch, short, shorts, or playlist URL."
+  fi
+
+  ensure_runtime_dependencies
+  init_cookie_args
+  mkdir -p "$OUTPUT_ROOT"
+
+  top_level_json="$(mktemp)"
+  top_level_error="$(mktemp)"
+
+  if ! fetch_top_level_json "$input_url" "$top_level_json" "$top_level_error"; then
+    if grep -qi 'Sign in to confirm your age' "$top_level_error"; then
+      die "Failed to access the URL. A signed-in ${COOKIE_BROWSER} profile is required for this age-restricted video."
+    fi
+    die "Failed to inspect the YouTube URL"
+  fi
+
+  if is_playlist_json "$top_level_json"; then
+    if process_playlist "$top_level_json"; then
+      rm -f "$top_level_json" "$top_level_error"
+      exit 0
+    fi
+    rm -f "$top_level_json" "$top_level_error"
+    exit 1
+  fi
+
+  if process_video "$input_url" "$OUTPUT_ROOT" "Video" ""; then
+    rm -f "$top_level_json" "$top_level_error"
+    exit 0
+  fi
+
+  rm -f "$top_level_json" "$top_level_error"
+  exit 1
+}
+
+main "$@"
