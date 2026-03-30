@@ -7,6 +7,7 @@ SCRIPT_NAME="ytb"
 OUTPUT_ROOT="${YTB_OUTPUT_ROOT:-${HOME}/Videos}"
 COOKIE_BROWSER="${YTB_COOKIES_BROWSER:-chrome}"
 AUTO_UPDATE_DAYS="${YTB_AUTO_UPDATE_DAYS:-7}"
+VIDEO_ENCODER_MODE="${YTB_VIDEO_ENCODER:-auto}"
 STATE_DIR="${XDG_STATE_HOME:-${HOME}/.local/state}/ytb"
 LOCAL_BIN_DIR="${HOME}/.local/bin"
 
@@ -14,6 +15,7 @@ CURRENT_LOG_FILE=""
 LAST_VIDEO_STATUS="failed"
 COOKIE_BROWSER_AVAILABLE=0
 YTDLP_BIN=""
+SELECTED_VIDEO_ENCODER="libx264"
 
 usage() {
   cat <<'EOF'
@@ -30,6 +32,7 @@ Optional environment variables:
 - YTB_OUTPUT_ROOT=/path/to/output
 - YTB_COOKIES_BROWSER=chrome|firefox|chromium|none
 - YTB_AUTO_UPDATE_DAYS=7
+- YTB_VIDEO_ENCODER=auto|cpu|libx264|h264_nvenc|hevc_nvenc|av1_nvenc
 EOF
 }
 
@@ -266,6 +269,48 @@ init_cookie_support() {
   warn "No usable ${COOKIE_BROWSER} browser profile was found. Public videos can still work, but age-restricted videos may fail."
 }
 
+ffmpeg_has_encoder() {
+  local encoder="$1"
+  grep -Eq "[[:space:]]${encoder}[[:space:]]" < <(ffmpeg -hide_banner -encoders 2>/dev/null)
+}
+
+init_video_encoder() {
+  case "$VIDEO_ENCODER_MODE" in
+    auto)
+      if command -v nvidia-smi >/dev/null 2>&1 && ffmpeg_has_encoder h264_nvenc; then
+        SELECTED_VIDEO_ENCODER="h264_nvenc"
+        log "Using NVIDIA GPU video encoding via h264_nvenc"
+      else
+        SELECTED_VIDEO_ENCODER="libx264"
+        log "Using CPU video encoding via libx264"
+      fi
+      ;;
+    cpu|libx264)
+      SELECTED_VIDEO_ENCODER="libx264"
+      log "Using CPU video encoding via libx264"
+      ;;
+    h264_nvenc|hevc_nvenc|av1_nvenc)
+      if command -v nvidia-smi >/dev/null 2>&1 && ffmpeg_has_encoder "$VIDEO_ENCODER_MODE"; then
+        SELECTED_VIDEO_ENCODER="$VIDEO_ENCODER_MODE"
+        log "Using NVIDIA GPU video encoding via ${SELECTED_VIDEO_ENCODER}"
+      else
+        warn "Requested ${VIDEO_ENCODER_MODE}, but it is not available. Falling back to CPU libx264."
+        SELECTED_VIDEO_ENCODER="libx264"
+      fi
+      ;;
+    *)
+      warn "Unknown YTB_VIDEO_ENCODER=${VIDEO_ENCODER_MODE}. Falling back to auto detection."
+      if command -v nvidia-smi >/dev/null 2>&1 && ffmpeg_has_encoder h264_nvenc; then
+        SELECTED_VIDEO_ENCODER="h264_nvenc"
+        log "Using NVIDIA GPU video encoding via h264_nvenc"
+      else
+        SELECTED_VIDEO_ENCODER="libx264"
+        log "Using CPU video encoding via libx264"
+      fi
+      ;;
+  esac
+}
+
 is_age_gate_error() {
   local error_file="$1"
   grep -Eiq 'Sign in to confirm your age|Please sign in|This video may be inappropriate for some users|age-restricted' "$error_file"
@@ -407,6 +452,7 @@ burn_subtitles() {
   local subtitle_path="$2"
   local output_path="$3"
   local workdir media_name output_name temp_subtitle temp_subtitle_name
+  local encoder="${SELECTED_VIDEO_ENCODER}"
   local status
 
   workdir="$(dirname "$subtitle_path")"
@@ -418,17 +464,31 @@ burn_subtitles() {
   cp "$subtitle_path" "$temp_subtitle" || return 1
 
   (
+    local -a video_args
     cd "$workdir" || exit 1
+
+    case "$encoder" in
+      h264_nvenc)
+        video_args=(-c:v h264_nvenc -preset p5 -rc:v vbr -cq:v 19 -b:v 0 -pix_fmt yuv420p)
+        ;;
+      hevc_nvenc)
+        video_args=(-c:v hevc_nvenc -preset p5 -rc:v vbr -cq:v 21 -b:v 0 -pix_fmt yuv420p)
+        ;;
+      av1_nvenc)
+        video_args=(-c:v av1_nvenc -preset p5 -cq:v 28 -b:v 0 -pix_fmt yuv420p)
+        ;;
+      *)
+        video_args=(-c:v libx264 -preset medium -crf 18 -pix_fmt yuv420p)
+        ;;
+    esac
+
     run_logged ffmpeg \
       -y \
       -i "$media_name" \
       -vf "subtitles=${temp_subtitle_name}" \
       -map "0:v:0" \
       -map "0:a?" \
-      -c:v libx264 \
-      -preset medium \
-      -crf 18 \
-      -pix_fmt yuv420p \
+      "${video_args[@]}" \
       -c:a aac \
       -b:a 192k \
       -movflags +faststart \
@@ -436,6 +496,32 @@ burn_subtitles() {
       "$output_name"
   )
   status=$?
+
+  if [[ "$status" -ne 0 && "$encoder" != "libx264" ]]; then
+    warn "GPU encode with ${encoder} failed. Retrying with CPU libx264."
+    rm -f "$temp_subtitle"
+    cp "$subtitle_path" "$temp_subtitle" || return 1
+    (
+      cd "$workdir" || exit 1
+      run_logged ffmpeg \
+        -y \
+        -i "$media_name" \
+        -vf "subtitles=${temp_subtitle_name}" \
+        -map "0:v:0" \
+        -map "0:a?" \
+        -c:v libx264 \
+        -preset medium \
+        -crf 18 \
+        -pix_fmt yuv420p \
+        -c:a aac \
+        -b:a 192k \
+        -movflags +faststart \
+        -sn \
+        "$output_name"
+    )
+    status=$?
+  fi
+
   rm -f "$temp_subtitle"
   return "$status"
 }
@@ -670,6 +756,7 @@ main() {
   ensure_base_dependencies
   ensure_ytdlp
   init_cookie_support
+  init_video_encoder
   mkdir -p "$OUTPUT_ROOT"
 
   top_level_json="$(mktemp)"

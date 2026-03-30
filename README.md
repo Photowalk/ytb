@@ -12,6 +12,7 @@ It downloads YouTube videos and playlists, saves each video into its own folder,
 - Creates one folder per video
 - Keeps the original downloaded media, subtitles, metadata, and logs
 - Burns manual English subtitles into a final MP4
+- Uses NVIDIA NVENC automatically when available, with CPU fallback
 - Never uses YouTube auto-generated subtitles
 - Retries age-restricted videos with browser cookies only when needed
 
@@ -58,6 +59,44 @@ This means:
 - later `ffmpeg` updates should come from normal Ubuntu package updates or by rerunning `./install.sh`
 
 If you specifically want upstream nightly `ffmpeg`, that is a different policy and should use a third-party source or static build. This repository does not do that by default.
+
+## GPU encoding
+
+Default video encoder mode:
+
+```bash
+auto
+```
+
+In `auto` mode, `ytb` does this:
+
+- if `nvidia-smi` exists and `ffmpeg` supports `h264_nvenc`, it uses NVIDIA GPU encoding
+- otherwise it falls back to CPU encoding with `libx264`
+
+You can force a specific encoder:
+
+```bash
+YTB_VIDEO_ENCODER=h264_nvenc ytb "https://www.youtube.com/watch?v=VIDEO_ID"
+```
+
+```bash
+YTB_VIDEO_ENCODER=cpu ytb "https://www.youtube.com/watch?v=VIDEO_ID"
+```
+
+Supported values:
+
+- `auto`
+- `cpu`
+- `libx264`
+- `h264_nvenc`
+- `hevc_nvenc`
+- `av1_nvenc`
+
+Important note:
+
+- subtitle rendering itself is still a software filter in ffmpeg
+- `ytb` uses the GPU for video encoding when NVENC is available
+- if GPU encoding fails at runtime, `ytb` automatically retries with CPU `libx264`
 
 ## Before you start
 
@@ -265,3 +304,18 @@ Common reasons:
 - region restriction
 - age restriction without usable browser cookies
 - temporary YouTube/network failure
+
+### I have an NVIDIA GPU but ytb still uses CPU
+
+Check these:
+
+```bash
+nvidia-smi
+ffmpeg -hide_banner -encoders | grep nvenc
+```
+
+If you want to force GPU encoding explicitly:
+
+```bash
+YTB_VIDEO_ENCODER=h264_nvenc ytb "https://www.youtube.com/watch?v=VIDEO_ID"
+```
