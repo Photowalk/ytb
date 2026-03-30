@@ -2,7 +2,7 @@
 
 `ytb` is an Ubuntu-focused command-line wrapper around `yt-dlp` and `ffmpeg`.
 
-It downloads YouTube videos and playlists, saves each video into its own folder, downloads only manual English subtitles, and burns those subtitles into a final MP4 when they exist.
+It downloads YouTube videos and playlists, saves each video into its own folder, downloads only manual English subtitles, and burns those subtitles into a final source-matched video when they exist.
 
 ## What it does
 
@@ -11,10 +11,12 @@ It downloads YouTube videos and playlists, saves each video into its own folder,
 - Supports playlists
 - Creates one folder per video
 - Keeps the original downloaded media, subtitles, metadata, and logs
-- Burns manual English subtitles into a final MP4
+- Burns manual English subtitles into a final source-matched video
 - Uses NVIDIA NVENC automatically when available, with CPU fallback
 - Never uses YouTube auto-generated subtitles
 - Retries age-restricted videos with browser cookies only when needed
+- Preserves source container, codec family, resolution, frame rate, pixel format, and audio layout whenever ffmpeg can read them directly from the source file
+- Reuses the source bitrate instead of picking a new quality target; when the stream bitrate is missing, it is calculated from the source packets
 
 ## Output layout
 
@@ -35,9 +37,15 @@ Inside each video folder:
 
 - downloaded media
 - manual English subtitle `.srt`, if available
-- burned MP4 `... [burned].mp4`, if subtitles were burned
+- burned output `... [burned].<ext>`, if subtitles were burned
 - `metadata.json`
 - `ytb.log`
+
+Burned output extension:
+
+- if the downloaded media is `webm`, the burned output is `webm`
+- if the downloaded media is `mp4`, `m4v`, or `mov`, the burned output is `mp4`
+- otherwise `ytb` keeps the same extension as the downloaded media
 
 ## Dependency policy
 
@@ -70,7 +78,7 @@ auto
 
 In `auto` mode, `ytb` does this:
 
-- if `nvidia-smi` exists and `ffmpeg` supports `h264_nvenc`, it uses NVIDIA GPU encoding
+- if `nvidia-smi` exists and ffmpeg supports a source-compatible NVENC encoder, it uses NVIDIA GPU encoding
 - otherwise it falls back to CPU encoding with `libx264`
 
 You can force a specific encoder:
@@ -95,8 +103,12 @@ Supported values:
 Important note:
 
 - subtitle rendering itself is still a software filter in ffmpeg
-- `ytb` uses the GPU for video encoding when NVENC is available
-- if GPU encoding fails at runtime, `ytb` automatically retries with CPU `libx264`
+- `ytb` tries to keep the source codec family when practical:
+  - source `av1` usually burns to `av1_nvenc` in `webm`
+  - source `h264` usually burns to `h264_nvenc` in `mp4`
+  - source `vp9` in `webm` prefers `libvpx-vp9`
+- `ytb` reuses the source resolution, frame rate, pixel format, color metadata, and bitrate
+- if GPU encoding fails at runtime for an `mp4` output, `ytb` automatically retries with CPU `libx264` while keeping the source bitrate
 
 ## Before you start
 
@@ -226,7 +238,7 @@ If you want to force a fresh install immediately:
   - `en-US`
   - `en-GB`
   - any other `en-*`
-- if no manual English subtitles exist, the video is still downloaded, but no burned MP4 is created
+- if no manual English subtitles exist, the video is still downloaded, but no burned output file is created
 
 ## Upgrade
 
@@ -317,5 +329,5 @@ ffmpeg -hide_banner -encoders | grep nvenc
 If you want to force GPU encoding explicitly:
 
 ```bash
-YTB_VIDEO_ENCODER=h264_nvenc ytb "https://www.youtube.com/watch?v=VIDEO_ID"
+YTB_VIDEO_ENCODER=av1_nvenc ytb "https://www.youtube.com/watch?v=VIDEO_ID"
 ```

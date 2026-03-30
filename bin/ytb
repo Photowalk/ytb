@@ -23,7 +23,7 @@ Usage: ytb <youtube-url>
 
 Downloads a YouTube video or playlist into ~/Videos by default.
 - Each video gets its own directory.
-- Manual English subtitles are burned into a final MP4 when available.
+- Manual English subtitles are burned into a final video when available.
 - Auto-generated subtitles are never used.
 - yt-dlp is auto-installed from the official upstream release and refreshed periodically.
 - Age-restricted videos retry with browser cookies only when needed.
@@ -274,12 +274,45 @@ ffmpeg_has_encoder() {
   grep -Eq "[[:space:]]${encoder}[[:space:]]" < <(ffmpeg -hide_banner -encoders 2>/dev/null)
 }
 
+stream_packet_bytes() {
+  local media_path="$1"
+  local stream_selector="$2"
+
+  ffprobe \
+    -v error \
+    -select_streams "$stream_selector" \
+    -show_entries packet=size \
+    -of csv=p=0 \
+    "$media_path" 2>/dev/null | awk 'NF { sum += $1 } END { printf "%.0f", sum + 0 }'
+}
+
+bitrate_from_bytes_and_duration() {
+  local total_bytes="$1"
+  local duration_seconds="$2"
+
+  awk -v bytes="$total_bytes" -v duration="$duration_seconds" '
+    BEGIN {
+      if (bytes <= 0 || duration <= 0) {
+        print 0
+      } else {
+        printf "%.0f", (bytes * 8) / duration
+      }
+    }
+  '
+}
+
+normalize_extension() {
+  local path="$1"
+  local ext="${path##*.}"
+  printf '%s' "${ext,,}"
+}
+
 init_video_encoder() {
   case "$VIDEO_ENCODER_MODE" in
     auto)
-      if command -v nvidia-smi >/dev/null 2>&1 && ffmpeg_has_encoder h264_nvenc; then
-        SELECTED_VIDEO_ENCODER="h264_nvenc"
-        log "Using NVIDIA GPU video encoding via h264_nvenc"
+      if command -v nvidia-smi >/dev/null 2>&1 && { ffmpeg_has_encoder av1_nvenc || ffmpeg_has_encoder h264_nvenc || ffmpeg_has_encoder hevc_nvenc; }; then
+        SELECTED_VIDEO_ENCODER="gpu-auto"
+        log "Using source-matched video encoding with NVIDIA GPU when supported"
       else
         SELECTED_VIDEO_ENCODER="libx264"
         log "Using CPU video encoding via libx264"
@@ -300,13 +333,79 @@ init_video_encoder() {
       ;;
     *)
       warn "Unknown YTB_VIDEO_ENCODER=${VIDEO_ENCODER_MODE}. Falling back to auto detection."
-      if command -v nvidia-smi >/dev/null 2>&1 && ffmpeg_has_encoder h264_nvenc; then
-        SELECTED_VIDEO_ENCODER="h264_nvenc"
-        log "Using NVIDIA GPU video encoding via h264_nvenc"
+      if command -v nvidia-smi >/dev/null 2>&1 && { ffmpeg_has_encoder av1_nvenc || ffmpeg_has_encoder h264_nvenc || ffmpeg_has_encoder hevc_nvenc; }; then
+        SELECTED_VIDEO_ENCODER="gpu-auto"
+        log "Using source-matched video encoding with NVIDIA GPU when supported"
       else
         SELECTED_VIDEO_ENCODER="libx264"
         log "Using CPU video encoding via libx264"
       fi
+      ;;
+  esac
+}
+
+select_source_matched_encoder() {
+  local source_codec="$1"
+
+  case "$VIDEO_ENCODER_MODE" in
+    auto)
+      case "$source_codec" in
+        av1)
+          if command -v nvidia-smi >/dev/null 2>&1 && ffmpeg_has_encoder av1_nvenc; then
+            printf 'av1_nvenc'
+            return 0
+          fi
+          ;;
+        h264)
+          if command -v nvidia-smi >/dev/null 2>&1 && ffmpeg_has_encoder h264_nvenc; then
+            printf 'h264_nvenc'
+            return 0
+          fi
+          printf 'libx264'
+          return 0
+          ;;
+        hevc)
+          if command -v nvidia-smi >/dev/null 2>&1 && ffmpeg_has_encoder hevc_nvenc; then
+            printf 'hevc_nvenc'
+            return 0
+          fi
+          ;;
+        vp9)
+          if ffmpeg_has_encoder libvpx-vp9; then
+            printf 'libvpx-vp9'
+            return 0
+          fi
+          ;;
+      esac
+      if [[ "$SELECTED_VIDEO_ENCODER" == "gpu-auto" ]]; then
+        printf 'libx264'
+      else
+        printf '%s' "$SELECTED_VIDEO_ENCODER"
+      fi
+      ;;
+    cpu|libx264)
+      printf 'libx264'
+      ;;
+    *)
+      printf '%s' "$SELECTED_VIDEO_ENCODER"
+      ;;
+  esac
+}
+
+burned_output_extension() {
+  local media_path="$1"
+  local ext
+
+  ext="$(normalize_extension "$media_path")"
+  case "$ext" in
+    webm)
+      printf 'webm'
+      ;;
+    mp4|m4v|mov)
+      printf 'mp4'
+      ;;
+    *)
+      printf '%s' "$ext"
       ;;
   esac
 }
@@ -452,35 +551,174 @@ burn_subtitles() {
   local subtitle_path="$2"
   local output_path="$3"
   local workdir media_name output_name temp_subtitle temp_subtitle_name
-  local encoder="${SELECTED_VIDEO_ENCODER}"
-  local status
+  local probe_json
+  local source_duration source_video_codec source_audio_codec source_pix_fmt
+  local source_color_range source_color_space source_color_transfer source_color_primaries
+  local source_video_bitrate source_audio_bitrate source_video_bytes source_audio_bytes
+  local output_extension encoder status
+  local -a video_args audio_args color_args container_args fallback_video_args fallback_pix_fmt_args
 
   workdir="$(dirname "$subtitle_path")"
   media_name="$(basename "$media_path")"
   output_name="$(basename "$output_path")"
   temp_subtitle_name=".ytb-burn-input.srt"
   temp_subtitle="${workdir}/${temp_subtitle_name}"
+  output_extension="$(normalize_extension "$output_path")"
+
+  probe_json="$(ffprobe \
+    -v error \
+    -show_entries stream=index,codec_name,codec_type,bit_rate,avg_frame_rate,pix_fmt,color_range,color_space,color_transfer,color_primaries,sample_rate,channels,channel_layout:format=duration \
+    -of json \
+    "$media_path" 2>/dev/null)" || return 1
+
+  source_duration="$(jq -r '.format.duration // "0"' <<<"$probe_json")"
+  source_video_codec="$(jq -r '.streams[] | select(.codec_type == "video") | .codec_name // empty' <<<"$probe_json" | head -n 1)"
+  source_audio_codec="$(jq -r '.streams[] | select(.codec_type == "audio") | .codec_name // empty' <<<"$probe_json" | head -n 1)"
+  source_pix_fmt="$(jq -r '.streams[] | select(.codec_type == "video") | .pix_fmt // empty' <<<"$probe_json" | head -n 1)"
+  source_color_range="$(jq -r '.streams[] | select(.codec_type == "video") | .color_range // empty' <<<"$probe_json" | head -n 1)"
+  source_color_space="$(jq -r '.streams[] | select(.codec_type == "video") | .color_space // empty' <<<"$probe_json" | head -n 1)"
+  source_color_transfer="$(jq -r '.streams[] | select(.codec_type == "video") | .color_transfer // empty' <<<"$probe_json" | head -n 1)"
+  source_color_primaries="$(jq -r '.streams[] | select(.codec_type == "video") | .color_primaries // empty' <<<"$probe_json" | head -n 1)"
+  source_video_bitrate="$(jq -r '.streams[] | select(.codec_type == "video") | .bit_rate // empty' <<<"$probe_json" | head -n 1)"
+  source_audio_bitrate="$(jq -r '.streams[] | select(.codec_type == "audio") | .bit_rate // empty' <<<"$probe_json" | head -n 1)"
+
+  if [[ -z "$source_video_bitrate" || ! "$source_video_bitrate" =~ ^[0-9]+$ || "$source_video_bitrate" -le 0 ]]; then
+    source_video_bytes="$(stream_packet_bytes "$media_path" "v:0")"
+    source_video_bitrate="$(bitrate_from_bytes_and_duration "$source_video_bytes" "$source_duration")"
+  fi
+
+  if [[ -z "$source_audio_bitrate" || ! "$source_audio_bitrate" =~ ^[0-9]+$ || "$source_audio_bitrate" -le 0 ]]; then
+    source_audio_bytes="$(stream_packet_bytes "$media_path" "a:0")"
+    source_audio_bitrate="$(bitrate_from_bytes_and_duration "$source_audio_bytes" "$source_duration")"
+  fi
+
+  [[ "$source_video_bitrate" =~ ^[0-9]+$ ]] || source_video_bitrate=0
+  [[ "$source_audio_bitrate" =~ ^[0-9]+$ ]] || source_audio_bitrate=0
+
+  encoder="$(select_source_matched_encoder "$source_video_codec")"
+  color_args=()
+  container_args=()
+
+  [[ -n "$source_color_range" ]] && color_args+=(-color_range "$source_color_range")
+  [[ -n "$source_color_space" ]] && color_args+=(-colorspace "$source_color_space")
+  [[ -n "$source_color_transfer" ]] && color_args+=(-color_trc "$source_color_transfer")
+  [[ -n "$source_color_primaries" ]] && color_args+=(-color_primaries "$source_color_primaries")
+
+  case "$output_extension" in
+    webm)
+      case "$encoder" in
+        av1_nvenc)
+          video_args=(
+            -fps_mode passthrough
+            -c:v av1_nvenc
+            -preset p5
+            -tune hq
+            -rc vbr
+            -b:v "$source_video_bitrate"
+            -maxrate "$source_video_bitrate"
+            -bufsize "$((source_video_bitrate * 2))"
+            -rc-lookahead 20
+            -spatial-aq 1
+            -temporal-aq 1
+          )
+          ;;
+        libvpx-vp9)
+          video_args=(
+            -fps_mode passthrough
+            -c:v libvpx-vp9
+            -deadline good
+            -cpu-used 3
+            -row-mt 1
+            -tile-columns 2
+            -frame-parallel 1
+            -b:v "$source_video_bitrate"
+            -minrate "$source_video_bitrate"
+            -maxrate "$source_video_bitrate"
+          )
+          ;;
+        *)
+          warn "Could not preserve source codec ${source_video_codec} for WebM. Falling back to AV1 NVENC bitrate-matched encoding."
+          video_args=(
+            -fps_mode passthrough
+            -c:v av1_nvenc
+            -preset p5
+            -tune hq
+            -rc vbr
+            -b:v "$source_video_bitrate"
+            -maxrate "$source_video_bitrate"
+            -bufsize "$((source_video_bitrate * 2))"
+            -rc-lookahead 20
+            -spatial-aq 1
+            -temporal-aq 1
+          )
+          ;;
+      esac
+
+      if [[ "$source_audio_codec" == "opus" || "$source_audio_codec" == "vorbis" ]]; then
+        audio_args=(-c:a copy)
+      else
+        audio_args=(-c:a libopus -b:a "$source_audio_bitrate")
+      fi
+      ;;
+    *)
+      case "$encoder" in
+        h264_nvenc)
+          video_args=(
+            -fps_mode passthrough
+            -c:v h264_nvenc
+            -preset p5
+            -tune hq
+            -rc vbr
+            -b:v "$source_video_bitrate"
+            -maxrate "$source_video_bitrate"
+            -bufsize "$((source_video_bitrate * 2))"
+            -rc-lookahead 20
+            -spatial-aq 1
+            -temporal-aq 1
+          )
+          ;;
+        hevc_nvenc)
+          video_args=(
+            -fps_mode passthrough
+            -c:v hevc_nvenc
+            -preset p5
+            -tune hq
+            -rc vbr
+            -b:v "$source_video_bitrate"
+            -maxrate "$source_video_bitrate"
+            -bufsize "$((source_video_bitrate * 2))"
+            -rc-lookahead 20
+            -spatial-aq 1
+            -temporal-aq 1
+          )
+          ;;
+        *)
+          video_args=(
+            -fps_mode passthrough
+            -c:v libx264
+            -preset medium
+            -b:v "$source_video_bitrate"
+            -maxrate "$source_video_bitrate"
+            -bufsize "$((source_video_bitrate * 2))"
+          )
+          ;;
+      esac
+
+      if [[ "$source_audio_codec" == "aac" || "$source_audio_codec" == "mp3" ]]; then
+        audio_args=(-c:a copy)
+      else
+        audio_args=(-c:a aac -b:a "$source_audio_bitrate")
+      fi
+      container_args=(-movflags +faststart)
+      ;;
+  esac
+
+  [[ -n "$source_pix_fmt" ]] && video_args+=(-pix_fmt "$source_pix_fmt")
 
   cp "$subtitle_path" "$temp_subtitle" || return 1
 
   (
-    local -a video_args
     cd "$workdir" || exit 1
-
-    case "$encoder" in
-      h264_nvenc)
-        video_args=(-c:v h264_nvenc -preset p5 -rc:v vbr -cq:v 19 -b:v 0 -pix_fmt yuv420p)
-        ;;
-      hevc_nvenc)
-        video_args=(-c:v hevc_nvenc -preset p5 -rc:v vbr -cq:v 21 -b:v 0 -pix_fmt yuv420p)
-        ;;
-      av1_nvenc)
-        video_args=(-c:v av1_nvenc -preset p5 -cq:v 28 -b:v 0 -pix_fmt yuv420p)
-        ;;
-      *)
-        video_args=(-c:v libx264 -preset medium -crf 18 -pix_fmt yuv420p)
-        ;;
-    esac
 
     run_logged ffmpeg \
       -y \
@@ -489,18 +727,28 @@ burn_subtitles() {
       -map "0:v:0" \
       -map "0:a?" \
       "${video_args[@]}" \
-      -c:a aac \
-      -b:a 192k \
-      -movflags +faststart \
+      "${color_args[@]}" \
+      "${audio_args[@]}" \
+      "${container_args[@]}" \
       -sn \
       "$output_name"
   )
   status=$?
 
-  if [[ "$status" -ne 0 && "$encoder" != "libx264" ]]; then
-    warn "GPU encode with ${encoder} failed. Retrying with CPU libx264."
+  if [[ "$status" -ne 0 && "$output_extension" == "mp4" && "$encoder" != "libx264" ]]; then
+    warn "GPU encode with ${encoder} failed. Retrying with CPU libx264 while preserving source bitrate."
     rm -f "$temp_subtitle"
     cp "$subtitle_path" "$temp_subtitle" || return 1
+    fallback_video_args=(
+      -fps_mode passthrough
+      -c:v libx264
+      -preset medium
+      -b:v "$source_video_bitrate"
+      -maxrate "$source_video_bitrate"
+      -bufsize "$((source_video_bitrate * 2))"
+    )
+    fallback_pix_fmt_args=()
+    [[ -n "$source_pix_fmt" ]] && fallback_pix_fmt_args=(-pix_fmt "$source_pix_fmt")
     (
       cd "$workdir" || exit 1
       run_logged ffmpeg \
@@ -509,12 +757,10 @@ burn_subtitles() {
         -vf "subtitles=${temp_subtitle_name}" \
         -map "0:v:0" \
         -map "0:a?" \
-        -c:v libx264 \
-        -preset medium \
-        -crf 18 \
-        -pix_fmt yuv420p \
-        -c:a aac \
-        -b:a 192k \
+        "${fallback_video_args[@]}" \
+        "${fallback_pix_fmt_args[@]}" \
+        "${color_args[@]}" \
+        "${audio_args[@]}" \
         -movflags +faststart \
         -sn \
         "$output_name"
@@ -540,7 +786,7 @@ process_video() {
 
   local metadata_json error_file used_cookies
   local raw_title safe_title video_id dir_name video_dir
-  local base_name base_path subtitle_lang subtitle_path burned_path
+  local base_name base_path subtitle_lang subtitle_path burned_path burned_ext
   local path_file media_path
 
   LAST_VIDEO_STATUS="failed"
@@ -646,7 +892,8 @@ process_video() {
     return 1
   fi
 
-  burned_path="${base_path} [burned].mp4"
+  burned_ext="$(burned_output_extension "$media_path")"
+  burned_path="${base_path} [burned].${burned_ext}"
   if ! burn_subtitles "$media_path" "$subtitle_path" "$burned_path"; then
     warn "Subtitle burn-in failed for ${raw_title}"
     rm -f "$metadata_json" "$error_file" "$path_file"
@@ -793,4 +1040,6 @@ main() {
   exit 1
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi
