@@ -49,24 +49,19 @@ Burned output extension:
 
 ## Dependency policy
 
-`ytb` installs and updates its dependencies in two different ways on purpose:
+`install.sh` installs everything `ytb` needs up front:
 
-- `yt-dlp`: installed from the official upstream GitHub release into `~/.local/bin/yt-dlp`
-- `ffmpeg`: installed from Ubuntu packages with `apt`
+- `curl`, `jq`, and `ffmpeg` from Ubuntu packages with `apt`
+- the latest official upstream `yt-dlp` release
+- the `ytb` launcher itself
 
-Why:
+After installation, `ytb` does not run `apt` and does not download `yt-dlp` during normal video downloads.
 
-- `yt-dlp` changes fast and the Ubuntu package is often too old for current YouTube behavior
-- `ffmpeg` is stable and safest to get from Ubuntu packages on Ubuntu systems
+If you want to refresh dependencies later, rerun:
 
-This means:
-
-- first install gets the latest upstream `yt-dlp`
-- every `ytb` run refreshes `yt-dlp` automatically if the last refresh was more than 7 days ago
-- `ffmpeg` is installed or upgraded by `install.sh`
-- later `ffmpeg` updates should come from normal Ubuntu package updates or by rerunning `./install.sh`
-
-If you specifically want upstream nightly `ffmpeg`, that is a different policy and should use a third-party source or static build. This repository does not do that by default.
+```bash
+./install.sh
+```
 
 ## GPU encoding
 
@@ -148,9 +143,14 @@ chmod +x install.sh
 
 What `install.sh` does:
 
-- installs or upgrades `curl`, `jq`, and `ffmpeg` with `apt`
-- downloads the latest official `yt-dlp` release into `~/.local/bin/yt-dlp`
-- installs `ytb` into `~/.local/bin/ytb`
+- installs `curl`, `jq`, and `ffmpeg` with `apt`
+- downloads the latest official `yt-dlp` release
+- installs `ytb` and `yt-dlp` into the same command directory
+
+Install target directory:
+
+- non-root user: `~/.local/bin`
+- `root`: `/usr/local/bin`
 
 ### 4. Reload your shell profile
 
@@ -177,6 +177,11 @@ Playlist:
 ```bash
 ytb "https://www.youtube.com/playlist?list=PLAYLIST_ID"
 ```
+
+Important:
+
+- quote YouTube URLs that contain `&`, such as `&t=30s` or `&list=...`
+- example: `ytb "https://www.youtube.com/watch?v=VIDEO_ID&t=30s"`
 
 ## Age-restricted videos
 
@@ -213,22 +218,6 @@ If you want to disable browser cookies entirely:
 YTB_COOKIES_BROWSER=none ytb "https://www.youtube.com/watch?v=VIDEO_ID"
 ```
 
-## Automatic `yt-dlp` updates
-
-`ytb` refreshes `yt-dlp` automatically if the last refresh was more than 7 days ago.
-
-You can change that interval:
-
-```bash
-YTB_AUTO_UPDATE_DAYS=3 ytb "https://www.youtube.com/watch?v=VIDEO_ID"
-```
-
-If you want to force a fresh install immediately:
-
-```bash
-./install.sh
-```
-
 ## Subtitle rules
 
 - only manual subtitles are used
@@ -263,6 +252,12 @@ This refreshes:
 rm -f ~/.local/bin/ytb ~/.local/bin/yt-dlp
 ```
 
+If you installed as `root`, remove these instead:
+
+```bash
+rm -f /usr/local/bin/ytb /usr/local/bin/yt-dlp
+```
+
 ## Troubleshooting
 
 ### `ytb: command not found`
@@ -273,7 +268,10 @@ Run:
 source ~/.profile
 ```
 
-If that still fails, verify that `~/.local/bin` is in your `PATH`.
+If that still fails:
+
+- non-root install: verify that `~/.local/bin` is in your `PATH`
+- root install: verify that `/usr/local/bin` is in your `PATH`
 
 ### A public video fails with old YouTube extraction errors
 

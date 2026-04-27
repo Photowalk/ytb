@@ -6,10 +6,8 @@ shopt -s nullglob
 SCRIPT_NAME="ytb"
 OUTPUT_ROOT="${YTB_OUTPUT_ROOT:-${HOME}/Videos}"
 COOKIE_BROWSER="${YTB_COOKIES_BROWSER:-chrome}"
-AUTO_UPDATE_DAYS="${YTB_AUTO_UPDATE_DAYS:-7}"
 VIDEO_ENCODER_MODE="${YTB_VIDEO_ENCODER:-auto}"
-STATE_DIR="${XDG_STATE_HOME:-${HOME}/.local/state}/ytb"
-LOCAL_BIN_DIR="${HOME}/.local/bin"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 CURRENT_LOG_FILE=""
 LAST_VIDEO_STATUS="failed"
@@ -25,13 +23,11 @@ Downloads a YouTube video or playlist into ~/Videos by default.
 - Each video gets its own directory.
 - Manual English subtitles are burned into a final video when available.
 - Auto-generated subtitles are never used.
-- yt-dlp is auto-installed from the official upstream release and refreshed periodically.
 - Age-restricted videos retry with browser cookies only when needed.
 
 Optional environment variables:
 - YTB_OUTPUT_ROOT=/path/to/output
 - YTB_COOKIES_BROWSER=chrome|firefox|chromium|none
-- YTB_AUTO_UPDATE_DAYS=7
 - YTB_VIDEO_ENCODER=auto|cpu|libx264|h264_nvenc|hevc_nvenc|av1_nvenc
 EOF
 }
@@ -105,7 +101,7 @@ ensure_base_dependencies() {
   local missing=()
   local dep
 
-  for dep in curl jq ffmpeg; do
+  for dep in jq ffmpeg ffprobe; do
     if ! command -v "$dep" >/dev/null 2>&1; then
       missing+=("$dep")
     fi
@@ -115,117 +111,27 @@ ensure_base_dependencies() {
     return 0
   fi
 
-  log "Installing missing Ubuntu packages: ${missing[*]}"
-
-  if ! command -v sudo >/dev/null 2>&1; then
-    die "sudo is required to install missing dependencies automatically"
-  fi
-
-  if ! sudo apt-get update; then
-    die "Failed to run: sudo apt-get update"
-  fi
-
-  if ! sudo apt-get install -y "${missing[@]}"; then
-    die "Failed to install required Ubuntu packages"
-  fi
-
-  for dep in curl jq ffmpeg; do
-    command -v "$dep" >/dev/null 2>&1 || die "$dep is still unavailable after installation"
-  done
-}
-
-detect_ytdlp_asset() {
-  case "$(uname -m)" in
-    x86_64|amd64)
-      printf 'yt-dlp_linux'
-      ;;
-    aarch64|arm64)
-      printf 'yt-dlp_linux_aarch64'
-      ;;
-    *)
-      printf 'yt-dlp'
-      ;;
-  esac
-}
-
-refresh_is_due() {
-  local stamp_file="$1"
-  local max_age_days="$2"
-  local now last_check
-
-  [[ -f "$stamp_file" ]] || return 0
-  now="$(date +%s)"
-  last_check="$(cat "$stamp_file" 2>/dev/null || printf '0')"
-
-  [[ "$last_check" =~ ^[0-9]+$ ]] || return 0
-  (( now - last_check >= max_age_days * 86400 ))
-}
-
-mark_refreshed() {
-  local stamp_file="$1"
-  mkdir -p "$(dirname "$stamp_file")"
-  date +%s >"$stamp_file"
-}
-
-install_latest_ytdlp() {
-  local target_path="${LOCAL_BIN_DIR}/yt-dlp"
-  local temp_file asset_name url version
-
-  mkdir -p "$LOCAL_BIN_DIR"
-  asset_name="$(detect_ytdlp_asset)"
-  url="https://github.com/yt-dlp/yt-dlp/releases/latest/download/${asset_name}"
-  temp_file="$(mktemp)"
-
-  log "Installing latest yt-dlp from official release"
-  if ! curl -fsSL "$url" -o "$temp_file"; then
-    rm -f "$temp_file"
-    return 1
-  fi
-
-  if ! install -m 0755 "$temp_file" "$target_path"; then
-    rm -f "$temp_file"
-    return 1
-  fi
-  rm -f "$temp_file"
-
-  YTDLP_BIN="$target_path"
-  version="$("$YTDLP_BIN" --version 2>/dev/null | head -n 1 || true)"
-  [[ -n "$version" ]] || return 1
-  log "Using yt-dlp ${version} from ${YTDLP_BIN}"
-  return 0
+  die "Missing required tools: ${missing[*]}. Re-run ./install.sh to install them."
 }
 
 ensure_ytdlp() {
-  local refresh_stamp="${STATE_DIR}/yt-dlp-last-refresh"
-  local system_ytdlp
-  local refresh_due=0
+  local candidate=""
+  local version=""
 
-  if [[ -x "${LOCAL_BIN_DIR}/yt-dlp" ]]; then
-    YTDLP_BIN="${LOCAL_BIN_DIR}/yt-dlp"
+  if [[ -x "${SCRIPT_DIR}/yt-dlp" ]]; then
+    candidate="${SCRIPT_DIR}/yt-dlp"
   else
-    system_ytdlp="$(command -v yt-dlp 2>/dev/null || true)"
-    if [[ -n "$system_ytdlp" ]]; then
-      YTDLP_BIN="$system_ytdlp"
-    fi
+    candidate="$(command -v yt-dlp 2>/dev/null || true)"
   fi
 
-  if refresh_is_due "$refresh_stamp" "$AUTO_UPDATE_DAYS"; then
-    refresh_due=1
+  if [[ -z "$candidate" || ! -x "$candidate" ]]; then
+    die "yt-dlp is not installed. Re-run ./install.sh."
   fi
 
-  if [[ -z "$YTDLP_BIN" || ! -x "$YTDLP_BIN" ]] || ((refresh_due)); then
-    if ! install_latest_ytdlp; then
-      if [[ -n "$YTDLP_BIN" && -x "$YTDLP_BIN" ]]; then
-        warn "Could not refresh yt-dlp from GitHub; falling back to ${YTDLP_BIN}"
-      else
-        die "Could not install yt-dlp from GitHub"
-      fi
-    else
-      mark_refreshed "$refresh_stamp"
-    fi
-  fi
-
-  [[ -n "$YTDLP_BIN" && -x "$YTDLP_BIN" ]] || die "yt-dlp is unavailable after installation"
+  YTDLP_BIN="$candidate"
+  version="$("$YTDLP_BIN" --version 2>/dev/null | head -n 1 || true)"
+  [[ -n "$version" ]] || die "yt-dlp exists but could not be executed: ${YTDLP_BIN}"
+  log "Using yt-dlp ${version} from ${YTDLP_BIN}"
 }
 
 browser_profile_exists() {
@@ -637,20 +543,39 @@ burn_subtitles() {
           )
           ;;
         *)
-          warn "Could not preserve source codec ${source_video_codec} for WebM. Falling back to AV1 NVENC bitrate-matched encoding."
-          video_args=(
-            -fps_mode passthrough
-            -c:v av1_nvenc
-            -preset p5
-            -tune hq
-            -rc vbr
-            -b:v "$source_video_bitrate"
-            -maxrate "$source_video_bitrate"
-            -bufsize "$((source_video_bitrate * 2))"
-            -rc-lookahead 20
-            -spatial-aq 1
-            -temporal-aq 1
-          )
+          if ffmpeg_has_encoder libvpx-vp9; then
+            warn "Could not preserve source codec ${source_video_codec} for WebM. Falling back to VP9 bitrate-matched encoding."
+            video_args=(
+              -fps_mode passthrough
+              -c:v libvpx-vp9
+              -deadline good
+              -cpu-used 3
+              -row-mt 1
+              -tile-columns 2
+              -frame-parallel 1
+              -b:v "$source_video_bitrate"
+              -minrate "$source_video_bitrate"
+              -maxrate "$source_video_bitrate"
+            )
+          elif command -v nvidia-smi >/dev/null 2>&1 && ffmpeg_has_encoder av1_nvenc; then
+            warn "Could not preserve source codec ${source_video_codec} for WebM. Falling back to AV1 NVENC bitrate-matched encoding."
+            video_args=(
+              -fps_mode passthrough
+              -c:v av1_nvenc
+              -preset p5
+              -tune hq
+              -rc vbr
+              -b:v "$source_video_bitrate"
+              -maxrate "$source_video_bitrate"
+              -bufsize "$((source_video_bitrate * 2))"
+              -rc-lookahead 20
+              -spatial-aq 1
+              -temporal-aq 1
+            )
+          else
+            warn "Could not preserve source codec ${source_video_codec} for WebM, and no usable WebM encoder is available on this machine."
+            return 1
+          fi
           ;;
       esac
 
@@ -992,6 +917,7 @@ main() {
 
   if [[ $# -ne 1 ]]; then
     usage >&2
+    log "Tip: quote YouTube URLs that contain '&', for example: ytb \"https://www.youtube.com/watch?v=VIDEO_ID&t=30s\""
     exit 1
   fi
 

@@ -4,7 +4,59 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SOURCE_SCRIPT="${SCRIPT_DIR}/bin/ytb"
-TARGET_DIR="${HOME}/.local/bin"
+
+choose_target_dir() {
+  if [[ -n "${YTB_INSTALL_DIR:-}" ]]; then
+    printf '%s' "$YTB_INSTALL_DIR"
+    return 0
+  fi
+
+  if [[ "${EUID}" -eq 0 ]]; then
+    printf '/usr/local/bin'
+    return 0
+  fi
+
+  printf '%s/.local/bin' "$HOME"
+}
+
+run_apt_get() {
+  if [[ "${EUID}" -eq 0 ]]; then
+    apt-get "$@"
+    return 0
+  fi
+
+  if ! command -v sudo >/dev/null 2>&1; then
+    echo "[install] ERROR: sudo is required to install Ubuntu packages." >&2
+    exit 1
+  fi
+
+  sudo apt-get "$@"
+}
+
+ensure_bootstrap_dependencies() {
+  local missing=()
+  local dep
+
+  for dep in curl jq ffmpeg; do
+    if ! command -v "$dep" >/dev/null 2>&1; then
+      missing+=("$dep")
+    fi
+  done
+
+  if ! command -v ffprobe >/dev/null 2>&1; then
+    missing+=("ffprobe")
+  fi
+
+  if ((${#missing[@]} == 0)); then
+    return 0
+  fi
+
+  echo "[install] Installing Ubuntu packages required by ytb: curl jq ffmpeg"
+  run_apt_get update
+  run_apt_get install -y curl jq ffmpeg
+}
+
+TARGET_DIR="$(choose_target_dir)"
 TARGET_SCRIPT="${TARGET_DIR}/ytb"
 TARGET_YTDLP="${TARGET_DIR}/yt-dlp"
 
@@ -41,31 +93,8 @@ if [[ ! -f "$SOURCE_SCRIPT" ]]; then
   exit 1
 fi
 
+ensure_bootstrap_dependencies
 mkdir -p "$TARGET_DIR"
-
-if ! command -v curl >/dev/null 2>&1 || ! command -v jq >/dev/null 2>&1 || ! command -v ffmpeg >/dev/null 2>&1; then
-  if ! command -v sudo >/dev/null 2>&1; then
-    echo "[install] ERROR: sudo is required to install curl, jq, and ffmpeg." >&2
-    exit 1
-  fi
-  if [[ ! -t 0 || ! -t 1 ]]; then
-    echo "[install] ERROR: curl, jq, and ffmpeg are required." >&2
-    echo "[install] Run this in a normal terminal first:" >&2
-    echo "sudo apt-get update && sudo apt-get install -y curl jq ffmpeg" >&2
-    exit 1
-  fi
-  echo "[install] Installing Ubuntu packages: curl jq ffmpeg"
-  sudo apt-get update
-  sudo apt-get install -y curl jq ffmpeg
-elif [[ -t 0 && -t 1 ]]; then
-  echo "[install] Refreshing Ubuntu packages: curl jq ffmpeg"
-  sudo apt-get update
-  sudo apt-get install -y --only-upgrade curl jq ffmpeg
-else
-  echo "[install] Non-interactive session detected; skipping Ubuntu package refresh."
-  echo "[install] To refresh Ubuntu packages later, run:"
-  echo "sudo apt-get update && sudo apt-get install -y --only-upgrade curl jq ffmpeg"
-fi
 
 install_latest_ytdlp
 install -m 0755 "$SOURCE_SCRIPT" "$TARGET_SCRIPT"
@@ -79,16 +108,11 @@ case ":${PATH}:" in
   *)
     cat <<EOF
 [install] ${TARGET_DIR} is not currently in PATH.
-[install] On Ubuntu, add this to ~/.profile if it is missing:
+[install] Add this to your shell profile:
 
-if [ -d "\$HOME/.local/bin" ] ; then
-    PATH="\$HOME/.local/bin:\$PATH"
-fi
-
-[install] Then run:
-source ~/.profile
+export PATH="${TARGET_DIR}:\$PATH"
 EOF
     ;;
 esac
 
-echo "[install] Next step: run 'ytb <youtube-url>'"
+echo "[install] Next step: run 'ytb \"https://www.youtube.com/watch?v=VIDEO_ID\"'"
